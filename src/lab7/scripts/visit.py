@@ -9,7 +9,7 @@ import rospy
 import actionlib
 
 from move_base_msgs.msg import MoveBaseAction, MoveBaseGoal
-from geometry_msgs.msg import Pose, PoseWithCovariance, PoseWithCovarianceStamped
+from geometry_msgs.msg import Pose, PoseWithCovarianceStamped, Twist
 from sensor_msgs.msg import LaserScan
 from nav_msgs.msg import Odometry
 
@@ -122,15 +122,15 @@ class MapFileManager:
 
 
 class PolesManager:
-    def __init__(self):
+    def __init__(self, map_file_manager):
+        self.map_file_manager = map_file_manager
+        
         self.visited = []
-        self.recognize_tolerance = 0.5
+        self.recognize_tolerance = 1.0 # TODO
         self.infinte_distance = 1000.0
-        self.distance_from_wall_threshold = 0.25
+        self.distance_from_wall_threshold = 0.28
         
         self.poles_pub = rospy.Publisher('/poles', Odometry, queue_size = 10)
-        
-        self.map_file_manager = MapFileManager('./src/lab7/data/map.yaml', './src/lab7/data/map.pgm')
     
     def publish_pole(self, pole): # tuple(float, float)
         pole_odom = Odometry()
@@ -175,6 +175,70 @@ class PolesManager:
         return (xs[res_idx], ys[res_idx]), (ranges[res_idx], thetas[res_idx])
 
 
+class MyController:
+    def __init__(self, k_rho, k_alpha, k_p, k_d, k_i, pole_manager):
+        self.k_rho, self.k_alpha = k_rho, k_alpha
+        self.k_p, self.k_d, self.k_i = k_p, k_d, k_i
+        self.pole_manager = pole_manager
+        
+        self.max_v = 0.16
+        self.min_v = -0.16
+        self.max_omega = 2.0
+        self.min_omega = -2.0
+        
+        self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size = 10)
+    
+    def stop(self):
+        self.cmd_vel_pub.publish(Twist())
+    
+    def park(self, rotate_only_time = 1.5):
+        v, omega, v_error_int, omega_error_int, a_linear, a_angular = 0, 0, 0, 0, 0, 0
+        timer = time.time()
+        failed_count = 0
+        while not rospy.is_shutdown():
+            _, rtheta = pole_manager.detect(*client.get_robot_xytheta())
+            if rtheta is None:
+                failed_count += 1
+                if failed_count >= 10:
+                    self.stop()
+                    break
+                continue
+            rho, alpha = rtheta[0], rtheta[1]
+            
+            # stop if parked
+            if rho < 0.15:
+                self.stop()
+                # TODO: go back a little in order to avoid costmap collision
+                break
+            
+            # backwarding
+            if abs(alpha) > np.pi / 2:
+                alpha = alpha + np.pi if alpha < 0 else alpha - np.pi
+                rho = -rho
+            
+            # target command
+            target_v = np.clip(self.k_rho * rho * (1 if abs(alpha) < np.pi / 2 else -1), self.min_v, self.max_v)
+            target_omega = np.clip(self.k_alpha * alpha, self.min_omega, self.max_omega)
+            
+            # real command
+            v_error = target_v - v
+            omega_error = target_omega - omega
+            v_error_int += v_error
+            omega_error_int += omega_error
+            v_error_dot = a_linear
+            omega_error_dot = a_angular
+            a_linear = self.k_p * v_error - self.k_d * v_error_dot + self.k_i * v_error_int
+            a_angular = self.k_p * omega_error - self.k_d * omega_error_dot + self.k_i * omega_error_int
+            v = np.clip(v + a_linear, self.min_v, self.max_v)
+            omega = np.clip(omega + a_angular, self.min_omega, self.max_omega)
+            
+            # publish command
+            twist = Twist()
+            twist.linear.x = v if time.time() - timer > rotate_only_time else 0
+            twist.angular.z = omega
+            self.cmd_vel_pub.publish(twist)
+
+
 if __name__ == '__main__':
     try:
         rospy.init_node('visit')
@@ -182,19 +246,23 @@ if __name__ == '__main__':
         client = MyMovebaseClient((3.114527131479146, 1.9957134028056018, np.deg2rad(176))) # P1
         # P3: (-1.207153081893921, -1.7155438661575317, -0.035394341186713855, 0.9993734240072419)
         
-        pole_manager = PolesManager()
+        map_file_manager = MapFileManager('./src/lab7/data/map.yaml', './src/lab7/data/map.pgm')
+        pole_manager = PolesManager(map_file_manager)
+        my_controller = MyController(0.6, 0.8, 0.25, 0.02, 0.01, pole_manager)
+        
+        pole_detect_max_distance = 2.0
         
         goals = [
             (1.892370461567939, 1.3399054878040552, np.deg2rad(180)), # P1-2, in, y+0.1
-            (-0.9659202038331747, 2.164093551514219, np.deg2rad(180)), # P2, x-0.1, y-0.1
-            (-0.9659202038331747, 2.164093551514219, np.deg2rad(-90)), # P2, x-0.1, y-0.1
+            (-1.0459202038331747, 2.284093551514219, np.deg2rad(180)), # P2, x-0.18, y+0.02
+            (-1.0459202038331747, 2.284093551514219, np.deg2rad(-90)), # P2, x-0.18, y+0.02
             (0.8941441783576553, -0.9154355192352538, np.deg2rad(-90)), # P12-34
-            (-1.1849005393302707, -1.7624668049043297, np.deg2rad(180)), # P3, x-0.08, y-0.05
-            (-1.1849005393302707, -1.7624668049043297, np.deg2rad(0)), # P3, x-0.08, y-0.05
-            (2.899912171347615, -2.0176318836143958, np.deg2rad(0)), # P4, y-0.05
-            (2.899912171347615, -2.0176318836143958, np.deg2rad(180)), # P4, y-0.05
-            (1.3058982355526936, 1.3136307594119567, 0), # P1-2, out
-            (3.114527131479146, 2.0557134028056018, np.deg2rad(176)), # P1, y+0.06, TODO
+            (-1.1849005393302707, -1.8024668049043297, np.deg2rad(180)), # P3, x-0.08, y-0.09
+            (-1.1849005393302707, -1.8024668049043297, np.deg2rad(0)), # P3, x-0.08, y-0.09
+            (2.949912171347615, -2.0176318836143958, np.deg2rad(0)), # P4, x+0.05, y-0.05
+            (2.949912171347615, -2.0176318836143958, np.deg2rad(180)), # P4, x+0.05, y-0.05
+            (1.3058982355526936, 1.3136307594119567, np.deg2rad(0)), # P1-2, out
+            (3.164527131479146, 2.0257134028056018, np.deg2rad(176)), # P1, x+0.05, y+0.03
         ]
         
         for goal in goals:
@@ -207,7 +275,7 @@ if __name__ == '__main__':
                 if pole_peek is None or pole_peek_rtheta is None:
                     continue # TODO: reset acc?
                 
-                if pole_peek is not None and not pole_manager.is_visited(pole_peek):
+                if pole_peek is not None and not pole_manager.is_visited(pole_peek) and pole_peek_rtheta[0] < pole_detect_max_distance:
                     if pole_detected is None:
                         pole_detected = pole_peek
                         pole_detected_acc = 1
@@ -227,7 +295,9 @@ if __name__ == '__main__':
                     
                     # navigate to pole_detected
                     client.cancel_goal()
-                    pole_peek_rtheta
+                    my_controller.park(rotate_only_time = 0.8)
+                    rospy.loginfo(f"Arrived at the pole, wait for 2 seconds ...")
+                    time.sleep(2.0)
                     
                     # add pole_detected to visited
                     pole_manager.visited.append(pole_detected)
@@ -238,6 +308,4 @@ if __name__ == '__main__':
     
     except rospy.ROSInterruptException:
         rospy.loginfo('ROSInterruptException')
-    except KeyboardInterrupt:
-        rospy.loginfo('KeyboardInterrupt')
 
