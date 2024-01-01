@@ -1,8 +1,0 @@
-[ 参数调整记录 ]
-	navigation
-		/opt/ros/noetic/share/turtlebot3_navigation/param
-			base_local_planner_params.yaml
-			dwa_local_planner_params_burger.yaml
-			move_base_params.yaml
-		/opt/ros/noetic/share/turtlebot3_navigation/launch
-			turtlebot3_navigation.launch

@@ -1,0 +1,24 @@
+[ Startup ]
+	Terminal 1:
+		roscore
+	Terminal 2:
+		ssh -A pi@192.168.3.216
+			(password: 1)
+		roslaunch turtlebot3_bringup turtlebot3_robot.launch
+	Terminal 3:
+		roslaunch turtlebot3_navigation turtlebot3_navigation.launch map_file:=$HOME/.map/map.yaml rviz_file:=$HOME/MyFiles/Workspace/ee346_ws/src/lab7/rviz/visit.rviz
+	Terminal 4 (VSCode):
+		cd ~/MyFiles/Workspace/ee346_ws
+		. devel/setup.sh
+		rosrun lab7 visit.py
+
+[ 参数调整记录 ]
+	navigation
+		/opt/ros/noetic/share/turtlebot3_navigation/param
+			base_local_planner_params.yaml
+			dwa_local_planner_params_burger.yaml
+			move_base_params.yaml
+		/opt/ros/noetic/share/turtlebot3_navigation/launch
+			amcl.launch
+			turtlebot3_navigation.launch
+

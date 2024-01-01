@@ -53,9 +53,13 @@ class MyMovebaseClient(actionlib.SimpleActionClient):
         
         # clear costmap
         rospy.wait_for_service('/move_base/clear_costmaps')
-        clear_costmaps_client = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
-        response = clear_costmaps_client()
+        self.clear_costmaps_client = rospy.ServiceProxy('/move_base/clear_costmaps', Empty)
+        response = self.clear_costmaps_client()
         time.sleep(1.0)
+        
+        # request nomotion update
+        rospy.wait_for_service('/request_nomotion_update')
+        self.request_nomotion_update_client = rospy.ServiceProxy('/request_nomotion_update', Empty)
     
     def amcl_pose_callback(self, msg):
         self.amcl_pose = msg
@@ -128,7 +132,8 @@ class PolesManager:
         self.visited = []
         self.recognize_tolerance = 1.0 # TODO
         self.infinte_distance = 1000.0
-        self.distance_from_wall_threshold = 0.28
+        self.distance_from_wall_threshold = 0.32
+        self.detect_max_distance = 1.5
         
         self.poles_pub = rospy.Publisher('/poles', Odometry, queue_size = 10)
     
@@ -168,6 +173,9 @@ class PolesManager:
         dists_from_wall = self.map_file_manager.get_min_distances_from(xs, ys)
         ranges[dists_from_wall < self.distance_from_wall_threshold] = self.infinte_distance
         
+        # remove points too far
+        ranges[ranges > self.detect_max_distance] = self.infinte_distance
+        
         # return the nearest among left points
         res_idx = np.argmin(ranges)
         if ranges[res_idx] == self.infinte_distance:
@@ -181,12 +189,20 @@ class MyController:
         self.k_p, self.k_d, self.k_i = k_p, k_d, k_i
         self.pole_manager = pole_manager
         
-        self.max_v = 0.16
-        self.min_v = -0.16
+        self.max_v = 0.20 # 0.16
+        self.min_v = -0.20 # -0.16
         self.max_omega = 2.0
         self.min_omega = -2.0
         
         self.cmd_vel_pub = rospy.Publisher('/cmd_vel', Twist, queue_size = 10)
+        self.cmd_vel_sub = rospy.Subscriber('/cmd_vel', Twist, self.cmd_vel_callback)
+        self.cmd_vel = None
+    
+    def cmd_vel_callback(self, msg):
+        self.cmd_vel = msg
+    
+    def is_motioning(self):
+        return self.cmd_vel is not None and (abs(self.cmd_vel.linear.x) > 0.03) # or abs(self.cmd_vel.angular.z) > 0.02)
     
     def stop(self):
         self.cmd_vel_pub.publish(Twist())
@@ -250,13 +266,11 @@ if __name__ == '__main__':
         pole_manager = PolesManager(map_file_manager)
         my_controller = MyController(0.6, 0.8, 0.25, 0.02, 0.01, pole_manager)
         
-        pole_detect_max_distance = 2.0
-        
         goals = [
-            (1.892370461567939, 1.3399054878040552, np.deg2rad(180)), # P1-2, in, y+0.1
+            (1.992370461567939, 1.3399054878040552, np.deg2rad(180)), # P1-2, in, x+0.1, y+0.1
             (-1.0459202038331747, 2.284093551514219, np.deg2rad(180)), # P2, x-0.18, y+0.02
             (-1.0459202038331747, 2.284093551514219, np.deg2rad(-90)), # P2, x-0.18, y+0.02
-            (0.8941441783576553, -0.9154355192352538, np.deg2rad(-90)), # P12-34
+            # (0.8941441783576553, -0.9154355192352538, np.deg2rad(-90)), # P12-34
             (-1.1849005393302707, -1.8024668049043297, np.deg2rad(180)), # P3, x-0.08, y-0.09
             (-1.1849005393302707, -1.8024668049043297, np.deg2rad(0)), # P3, x-0.08, y-0.09
             (2.949912171347615, -2.0176318836143958, np.deg2rad(0)), # P4, x+0.05, y-0.05
@@ -271,17 +285,22 @@ if __name__ == '__main__':
             pole_detected_acc = 0
             pole_detected = None
             while not rospy.is_shutdown() and not client.wait_for_result(rospy.Duration(0.03)): # not rospy.is_shutdown() for SIGINT (?)
+                # force update amcl
+                response = client.request_nomotion_update_client()
+                
+                # detect pole
                 pole_peek, pole_peek_rtheta = pole_manager.detect(*client.get_robot_xytheta())
                 if pole_peek is None or pole_peek_rtheta is None:
                     continue # TODO: reset acc?
                 
-                if pole_peek is not None and not pole_manager.is_visited(pole_peek) and pole_peek_rtheta[0] < pole_detect_max_distance:
+                if pole_peek is not None and not pole_manager.is_visited(pole_peek): # and pole_peek_rtheta[0] < pole_detect_max_distance:
                     if pole_detected is None:
                         pole_detected = pole_peek
                         pole_detected_acc = 1
                     else:
                         if pole_manager.is_same(pole_peek, pole_detected):
-                            pole_detected_acc += 1
+                            if my_controller.is_motioning():
+                                pole_detected_acc += 1
                         else:
                             pole_detected = pole_peek
                             pole_detected_acc = 1
@@ -295,9 +314,16 @@ if __name__ == '__main__':
                     
                     # navigate to pole_detected
                     client.cancel_goal()
-                    my_controller.park(rotate_only_time = 0.8)
+                    my_controller.park(rotate_only_time = 2.0)
                     rospy.loginfo(f"Arrived at the pole, wait for 2 seconds ...")
                     time.sleep(2.0)
+                    
+                    # go back a little
+                    rospy.loginfo(f"going back a little ...")
+                    cmd = Twist()
+                    cmd.linear.x = -0.05
+                    my_controller.cmd_vel_pub.publish(cmd)
+                    time.sleep(1.0)
                     
                     # add pole_detected to visited
                     pole_manager.visited.append(pole_detected)
